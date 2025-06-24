@@ -1,4 +1,7 @@
+python-dotenv
 aiogram
+aiohttp
+openai
 youtube-transcript-api
 transformers
 torch
