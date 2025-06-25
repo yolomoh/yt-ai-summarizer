@@ -17,21 +17,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+PROXY_URL = os.getenv("PROXY_URL")  # Optional: move proxy to .env
+
 if not BOT_TOKEN:
     raise ValueError("Missing BOT_TOKEN in environment variables")
 
-# === Telegram Setup ===
 router = Router()
 chat_context = {}
 
-# === Markdown Escaper ===
 def escape_markdown(text: str) -> str:
     escape_chars = r"_*[]()~`>#+-=|{}.!\\"
     return "".join(f"\\{c}" if c in escape_chars else c for c in text)
-
-# === Helper Functions ===
 
 def get_video_id(url: str) -> str:
     match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:\?|\&|$)", url)
@@ -40,15 +37,20 @@ def get_video_id(url: str) -> str:
     return match.group(1)
 
 def fetch_transcript(video_id: str, skip_silences=True, min_words=2) -> list[str]:
-    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    # Set proxy
+    proxy_url = PROXY_URL or "socks5://98.162.25.23:4145"  # Fallback public proxy
+    proxies = {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
+
+    transcript = YouTubeTranscriptApi.get_transcript(video_id, proxies=proxies)
     lines = [
         e['text'].strip()
         for e in transcript
         if e['text'].strip() and (not skip_silences or len(e['text'].split()) >= min_words and e['duration'] <= 7)
     ]
     return lines
-
-# === Lightweight Fallbacks ===
 
 def simple_summary(lines: list[str], max_lines=5) -> str:
     long_lines = [l for l in lines if len(l.split()) > 5]
@@ -60,8 +62,6 @@ def simple_answer(context: str, question: str) -> str:
     keywords = question.lower().split()
     matches = [s for s in sentences if any(k in s.lower() for k in keywords)]
     return ". ".join(matches[:3]) or "No answer found in the transcript."
-
-# === Telegram Handlers ===
 
 @router.message(F.text == "/start")
 async def cmd_start(msg: Message):
@@ -141,8 +141,6 @@ async def handle_question(msg: Message):
     except Exception as e:
         logger.error(f"Q&A error: {e}")
         await msg.answer(f"❌ Couldn't answer: {escape_markdown(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
-
-# === Async Runner ===
 
 async def main():
     session = AiohttpSession()
