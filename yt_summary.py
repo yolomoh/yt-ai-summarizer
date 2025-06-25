@@ -2,19 +2,15 @@ import os
 import re
 import asyncio
 import logging
+from collections import Counter
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.utils.token import TokenValidationError
-
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
-
-import openai
-from transformers import pipeline
 
 # === Logging ===
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -22,19 +18,9 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# === API Keys ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not BOT_TOKEN or not OPENAI_API_KEY:
-    raise ValueError("Missing BOT_TOKEN or OPENAI_API_KEY in environment variables")
-
-openai.api_key = OPENAI_API_KEY
-
-# === Load Fallback Transformers ===
-logger.info("🔁 Loading local fallback models…")
-summarizer_fallback = pipeline("summarization", model="facebook/bart-large-cnn")
-qa_fallback = pipeline("question-answering", model="distilbert-base-uncased-distilled-squad")
-logger.info("✅ Local models ready.")
+if not BOT_TOKEN:
+    raise ValueError("Missing BOT_TOKEN in environment variables")
 
 # === Telegram Setup ===
 router = Router()
@@ -62,58 +48,18 @@ def fetch_transcript(video_id: str, skip_silences=True, min_words=2) -> list[str
     ]
     return lines
 
-async def summarize_openai(text: str) -> str:
-    try:
-        response = await asyncio.wait_for(
-            openai.ChatCompletion.acreate(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant. Summarize the following transcript."},
-                    {"role": "user", "content": text}
-                ],
-                temperature=0.7,
-                max_tokens=512
-            ),
-            timeout=30
-        )
-        return response.choices[0].message.content.strip()
-    except asyncio.TimeoutError:
-        logger.warning("OpenAI summary timed out")
-        raise openai.OpenAIError("Summary request timed out")
+# === Lightweight Fallbacks ===
 
-async def answer_openai(context: str, question: str) -> str:
-    try:
-        response = await asyncio.wait_for(
-            openai.ChatCompletion.acreate(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "Answer based solely on the user-provided transcript."},
-                    {"role": "assistant", "content": context},
-                    {"role": "user", "content": question}
-                ],
-                temperature=0
-            ),
-            timeout=30
-        )
-        return response.choices[0].message.content.strip()
-    except asyncio.TimeoutError:
-        logger.warning("OpenAI Q&A timed out")
-        raise openai.OpenAIError("Q&A request timed out")
+def simple_summary(lines: list[str], max_lines=5) -> str:
+    long_lines = [l for l in lines if len(l.split()) > 5]
+    most_common = Counter(long_lines).most_common(max_lines)
+    return "\n".join([line for line, _ in most_common]) or "Summary not available."
 
-def summarize_fallback(lines: list[str]) -> str:
-    text = " ".join(lines)
-    if len(text.split()) < 50:
-        return text
-    chunks = [" ".join(text.split()[i:i+900]) for i in range(0, len(text.split()), 900)]
-    res = []
-    for c in chunks:
-        out = summarizer_fallback(c, max_length=130, min_length=30, do_sample=False)
-        res.append(out[0]['summary_text'])
-    return "\n".join(res)
-
-def answer_fallback(context: str, question: str) -> str:
-    res = qa_fallback(question=question, context=context)
-    return res["answer"]
+def simple_answer(context: str, question: str) -> str:
+    sentences = context.split(". ")
+    keywords = question.lower().split()
+    matches = [s for s in sentences if any(k in s.lower() for k in keywords)]
+    return ". ".join(matches[:3]) or "No answer found in the transcript."
 
 # === Telegram Handlers ===
 
@@ -130,19 +76,14 @@ async def handle_video(msg: Message):
         vid = get_video_id(msg.text)
         lines = fetch_transcript(vid)
         logger.info(f"Fetched {len(lines)} lines")
-        context_text = " ".join(lines[:3000])  # avoid token explosion
+        context_text = " ".join(lines[:3000])
 
         transcript_text = "\n".join(lines)
         filename = f"transcript_{vid}.txt"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(transcript_text)
 
-        try:
-            summary = await summarize_openai(context_text)
-        except openai.OpenAIError as e:
-            logger.warning(f"OpenAI summary failed: {e}. Using fallback")
-            summary = summarize_fallback(lines)
-
+        summary = simple_summary(lines)
         chat_context[msg.chat.id] = context_text
 
         await msg.answer(f"📄 Summary:\n{escape_markdown(summary)}", parse_mode=ParseMode.MARKDOWN_V2)
@@ -194,11 +135,7 @@ async def handle_question(msg: Message):
     try:
         question = msg.text.strip()
         logger.info(f"[{msg.chat.id}] Q: {question}")
-        try:
-            ans = await answer_openai(ctx, question)
-        except openai.OpenAIError as e:
-            logger.warning(f"OpenAI Q&A failed: {e}. Using fallback")
-            ans = answer_fallback(ctx, question)
+        ans = simple_answer(ctx, question)
         logger.info(f"A: {ans}")
         await msg.answer(f"*A:* {escape_markdown(ans)}", parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:
@@ -222,7 +159,5 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except TokenValidationError:
-        logger.error("Invalid BOT_TOKEN")
     except Exception:
         logger.exception("Unexpected error")
